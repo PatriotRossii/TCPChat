@@ -1,14 +1,12 @@
-use std::io::BufRead;
-use std::{
-    io::{BufReader, Write},
-    net::{Shutdown, TcpListener, TcpStream},
-    sync::{mpsc, Arc, Mutex},
-    thread::{self, JoinHandle},
+use shared::ChatMessage;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, ToSocketAddrs},
+    sync::broadcast,
 };
+use tokio_util::codec::{Decoder, Encoder};
 
-pub struct TCPChatServer {
-    storage: Arc<Mutex<Vec<TcpStream>>>,
-}
+pub struct TCPChatServer {}
 
 impl Default for TCPChatServer {
     fn default() -> Self {
@@ -18,68 +16,59 @@ impl Default for TCPChatServer {
 
 impl TCPChatServer {
     pub fn new() -> Self {
-        let storage = Arc::new(Mutex::new(vec![]));
-        TCPChatServer { storage }
+        Self {}
     }
 
-    pub fn run(&self) -> JoinHandle<()> {
-        let handle_storage = self.storage.clone();
-        thread::spawn(move || {
-            let listener = TcpListener::bind("127.0.0.1:80").unwrap();
-            println!("Start listening on {:?}", &listener);
+    pub async fn run<T>(self, addr: T) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        T: ToSocketAddrs,
+    {
+        let listener = TcpListener::bind(addr).await?;
+        let (tx, _) = broadcast::channel::<ChatMessage>(100);
 
-            let (sender, receiver) = mpsc::channel::<String>();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, write) = socket.into_split();
 
-            let translator_storage = handle_storage.clone();
-            thread::spawn(move || loop {
-                if let Ok(message) = receiver.recv() {
-                    for mut client in translator_storage.lock().unwrap().iter() {
-                        println!("Transmitting {}", &message);
-                        client.write_all(message.as_bytes()).unwrap();
+            let tx = tx.clone();
+            let mut rx = tx.subscribe();
+
+            tokio::spawn(async move {
+                let mut socket = read;
+                let mut decoder = tokio_serde_cbor::Decoder::<ChatMessage>::new();
+
+                loop {
+                    let mut buffer = bytes::BytesMut::with_capacity(1024);
+                    let data = socket.read_buf(&mut buffer).await;
+
+                    if data.is_err() {
+                        println!("Err reading buffer");
+                    }
+
+                    if let Ok(Some(e)) = decoder.decode(&mut buffer) {
+                        if tx.send(e).is_err() {
+                            println!("Failed to send message to channel");
+                        }
                     }
                 }
             });
 
-            for stream in listener.incoming() {
-                let stream = stream.unwrap();
-                stream.set_read_timeout(None).unwrap();
+            tokio::spawn(async move {
+                let mut socket = write;
+                let mut encoder = tokio_serde_cbor::Encoder::<ChatMessage>::new();
 
-                let stream_addr = stream.local_addr().unwrap();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-
-                println!("Successfully established connection with {:?}", stream_addr);
-
-                handle_storage
-                    .lock()
-                    .unwrap()
-                    .push(stream.try_clone().unwrap());
-                let sender = sender.clone();
-
-                thread::spawn(move || loop {
-                    println!("Trying to read message from {:?}", &stream_addr);
-
-                    let mut buf = String::new();
-                    let res = reader.read_line(&mut buf);
-                    if res.is_ok() {
-                        println!(
-                            "Successfully read message from {:?}. Transmitting",
-                            &stream_addr
-                        );
-                        match sender.send(buf) {
-                            Ok(_) => println!("Message was successfully transmitted"),
-                            Err(e) => println!("Message was failed to transmit because of {:?}", e),
+                loop {
+                    while let Ok(e) = rx.recv().await {
+                        let mut buffer = bytes::BytesMut::with_capacity(1024);
+                        if encoder.encode(e, &mut buffer).is_err() {
+                            println!("Error encoding buffer");
                         }
-                    } else {
-                        println!(
-                            "Reading message from {} was failed. Shutting down the connection",
-                            &stream_addr
-                        );
-                        stream.shutdown(Shutdown::Both).expect("Failed to shutdown");
-                        println!("Connection was successfully shutted down");
-                        break;
+                        if socket.write_buf(&mut buffer).await.is_err() {
+                            println!("Error sending buffer");
+                        }
                     }
-                });
-            }
-        })
+                }
+            });
+        }
     }
 }

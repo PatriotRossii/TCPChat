@@ -1,7 +1,11 @@
 use server::TCPChatServer;
 
-fn main() {
+#[tokio::main]
+pub async fn main() {
+    let addr = std::env::var("ADDR").expect("Please, specify env var: ADDR");
     let server = TCPChatServer::new();
-    let server_handle = server.run();
-    server_handle.join().unwrap();
+
+    if let Err(err) = server.run(addr).await {
+        println!("Error: {:?}", err);
+    }
 }
